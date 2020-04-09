@@ -1460,9 +1460,8 @@ public class Queue extends ResourceController implements Saveable {
         }
     }
 
-    // update parked
+    // get executors that are currently waiting for a job to run.
     private Map<Executor, JobOffer> getParked(Computer[] computers) {
-        // The executors that are currently waiting for a job to run.
         Map<Executor, JobOffer> parked = new HashMap<>();
         for (Computer c : computers) {
             for (Executor e : c.getAllExecutors()) {
@@ -1499,8 +1498,10 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     // remove lost pendings from the pendings list
-    private void updatePendings(List<BuildableItem> lostPendings) {
-        for (BuildableItem p: lostPendings) {
+    private void updatePendings() {
+        Jenkins jenkins = Jenkins.getInstanceOrNull();
+        if (jenkins == null) return; // double check Jenkins instance is alive
+        for (BuildableItem p: getLostPendings(jenkins.getComputers())) {
             if (LOGGER.isLoggable(Level.FINE)) {
                 LOGGER.log(Level.FINE,
                         "BuildableItem {0}: pending -> buildable as the assigned executor disappeared",
@@ -1509,6 +1510,153 @@ public class Queue extends ResourceController implements Saveable {
             p.isPending = false;
             pendings.remove(p);
             makeBuildable(p); // TODO whatever this is for, the return value is being ignored, so this does nothing at all
+        }
+    }
+
+    private void updateBlocked() {
+        final QueueSorter s = sorter;
+
+        // copy as we'll mutate the list and we want to process in a potentially different order
+        List<BlockedItem> blockedItems = new ArrayList<>(blockedProjects.values());
+        // if facing a cycle of blocked tasks, ensure we process in the desired sort order
+        if (s != null) {
+            s.sortBlockedItems(blockedItems);
+        } else {
+            blockedItems.sort(QueueSorter.DEFAULT_BLOCKED_ITEM_COMPARATOR);
+        }
+        for (BlockedItem p : blockedItems) {
+            String taskDisplayName = LOGGER.isLoggable(Level.FINEST) ? p.task.getFullDisplayName() : null;
+            LOGGER.log(Level.FINEST, "Current blocked item: {0}", taskDisplayName);
+            CauseOfBlockage causeOfBlockage = getCauseOfBlockageForItem(p);
+            if (causeOfBlockage == null) { // blocked -> buildable
+                LOGGER.log(Level.FINEST,
+                        "BlockedItem {0}: blocked -> buildable as the build is not blocked and new tasks are allowed",
+                        taskDisplayName);
+
+                // ready to be executed
+                Runnable r = makeBuildable(new BuildableItem(p));
+                if (r != null) {
+                    p.leave(this);
+                    r.run();
+                    // JENKINS-28926 we have removed a task from the blocked projects and added to building
+                    // thus we should update the snapshot so that subsequent blocked projects can correctly
+                    // determine if they are blocked by the lucky winner
+                    updateSnapshot();
+                }
+            } else {
+                p.setCauseOfBlockage(causeOfBlockage);
+            }
+        }
+    }
+
+    private void updateWaiting() {
+        while (!waitingList.isEmpty()) {
+            WaitingItem top = peek();
+
+            if (top.timestamp.compareTo(new GregorianCalendar()) > 0) {
+                LOGGER.log(Level.FINEST, "Finished moving all ready items from queue.");
+                break; // finished moving all ready items from queue
+            }
+
+            top.leave(this);
+            CauseOfBlockage causeOfBlockage = getCauseOfBlockageForItem(top);
+            if (causeOfBlockage == null) { // waitingList -> buildable/blocked
+                // ready to be executed immediately
+                Runnable r = makeBuildable(new BuildableItem(top));
+                String topTaskDisplayName = LOGGER.isLoggable(Level.FINEST) ? top.task.getFullDisplayName() : null;
+                if (r != null) {
+                    LOGGER.log(Level.FINEST, "Executing runnable {0}", topTaskDisplayName);
+                    r.run();
+                } else {
+                    LOGGER.log(Level.FINEST, "Item {0} was unable to be made a buildable and is now a blocked item.", topTaskDisplayName);
+                    new BlockedItem(top, CauseOfBlockage.fromMessage(Messages._Queue_HudsonIsAboutToShutDown())).enter(this);
+                }
+            } else {
+                // this can't be built now because another build is in progress
+                // set this project aside.
+                new BlockedItem(top, causeOfBlockage).enter(this);
+            }
+        }
+    }
+
+    private void assignBuildablesToExecutors(Map<Executor, JobOffer> parked) {
+        // allocate buildable jobs to executors
+        for (BuildableItem p : new ArrayList<>(buildables)) {// copy as we'll mutate the list in the loop
+            // one last check to make sure this build is not blocked.
+            CauseOfBlockage causeOfBlockage = getCauseOfBlockageForItem(p);
+            if (causeOfBlockage != null) {
+                p.leave(this);
+                new BlockedItem(p, causeOfBlockage).enter(this);
+                LOGGER.log(Level.FINE, "Catching that {0} is blocked in the last minute", p);
+                // JENKINS-28926 we have moved an unblocked task into the blocked state, update snapshot
+                // so that other buildables which might have been blocked by this can see the state change
+                updateSnapshot();
+                continue;
+            }
+
+            String taskDisplayName = LOGGER.isLoggable(Level.FINEST) ? p.task.getFullDisplayName() : null;
+
+            if (p.task instanceof FlyweightTask) {
+                Runnable r = makeFlyWeightTaskBuildable(new BuildableItem(p));
+                if (r != null) {
+                    p.leave(this);
+                    LOGGER.log(Level.FINEST, "Executing flyweight task {0}", taskDisplayName);
+                    r.run();
+                    updateSnapshot();
+                }
+            } else {
+                List<JobOffer> candidates = new ArrayList<>(parked.size());
+                List<CauseOfBlockage> reasons = new ArrayList<>(parked.size());
+                for (JobOffer j : parked.values()) {
+                    CauseOfBlockage reason = j.getCauseOfBlockage(p);
+                    if (reason == null) {
+                        LOGGER.log(Level.FINEST,
+                                "{0} is a potential candidate for task {1}",
+                                new Object[]{j, taskDisplayName});
+                        candidates.add(j);
+                    } else {
+                        LOGGER.log(Level.FINEST, "{0} rejected {1}: {2}", new Object[] {j, taskDisplayName, reason});
+                        reasons.add(reason);
+                    }
+                }
+
+                MappingWorksheet ws = new MappingWorksheet(p, candidates);
+                Mapping m = loadBalancer.map(p.task, ws);
+                if (m == null) {
+                    // if we couldn't find the executor that fits,
+                    // just leave it in the buildables list and
+                    // check if we can execute other projects
+                    LOGGER.log(Level.FINER, "Failed to map {0} to executors. candidates={1} parked={2}",
+                            new Object[]{p, candidates, parked.values()});
+                    p.transientCausesOfBlockage = reasons.isEmpty() ? null : reasons;
+                    continue;
+                }
+
+                // found a matching executor. use it.
+                WorkUnitContext wuc = new WorkUnitContext(p);
+                LOGGER.log(Level.FINEST, "Found a matching executor for {0}. Using it.", taskDisplayName);
+                m.execute(wuc);
+
+                p.leave(this);
+                if (!wuc.getWorkUnits().isEmpty()) {
+                    LOGGER.log(Level.FINEST, "BuildableItem {0} marked as pending.", taskDisplayName);
+                    makePending(p);
+                } else {
+                    LOGGER.log(Level.FINEST, "BuildableItem {0} with empty work units!?", p);
+                }
+
+                // Ensure that identification of blocked tasks is using the live state: JENKINS-27708 & JENKINS-27871
+                // The creation of a snapshot itself should be relatively cheap given the expected rate of
+                // job execution. You probably would need 100's of jobs starting execution every iteration
+                // of maintain() before this could even start to become an issue and likely the calculation
+                // of getCauseOfBlockageForItem(p) will become a bottleneck before updateSnapshot() will. Additionally
+                // since the snapshot itself only ever has at most one reference originating outside of the stack
+                // it should remain in the eden space and thus be cheap to GC.
+                // See https://jenkins-ci.org/issue/27708?focusedCommentId=225819&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-225819
+                // or https://jenkins-ci.org/issue/27708?focusedCommentId=225906&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-225906
+                // for alternative fixes of this issue.
+                updateSnapshot();
+            }
         }
     }
 
@@ -1530,177 +1678,39 @@ public class Queue extends ResourceController implements Saveable {
             return;
         }
         lock.lock();
-        try { try {
+        try {
+            try {
 
-            LOGGER.log(Level.FINE, "Queue maintenance started on {0} with {1}", new Object[] {this, snapshot});
+                LOGGER.log(Level.FINE, "Queue maintenance started on {0} with {1}", new Object[] {this, snapshot});
 
-            // The executors that are currently waiting for a job to run.
-            Map<Executor, JobOffer> parked = getParked(jenkins.getComputers());
+                // The executors that are currently waiting for a job to run.
+                Map<Executor, JobOffer> parked = getParked(jenkins.getComputers());
 
-            {
-                List<BuildableItem> lostPendings = getLostPendings(jenkins.getComputers());
-                updatePendings(lostPendings);
-            }
+                updatePendings();
 
-            final QueueSorter s = sorter;
+                updateBlocked();
 
-            {// blocked -> buildable
-                // copy as we'll mutate the list and we want to process in a potentially different order
-                List<BlockedItem> blockedItems = new ArrayList<>(blockedProjects.values());
-                // if facing a cycle of blocked tasks, ensure we process in the desired sort order
+                updateWaiting();
+
+                final QueueSorter s = sorter;
                 if (s != null) {
-                    s.sortBlockedItems(blockedItems);
-                } else {
-                    blockedItems.sort(QueueSorter.DEFAULT_BLOCKED_ITEM_COMPARATOR);
-                }
-                for (BlockedItem p : blockedItems) {
-                    String taskDisplayName = LOGGER.isLoggable(Level.FINEST) ? p.task.getFullDisplayName() : null;
-                    LOGGER.log(Level.FINEST, "Current blocked item: {0}", taskDisplayName);
-                    CauseOfBlockage causeOfBlockage = getCauseOfBlockageForItem(p);
-                    if (causeOfBlockage == null) {
-                        LOGGER.log(Level.FINEST,
-                                "BlockedItem {0}: blocked -> buildable as the build is not blocked and new tasks are allowed",
-                                taskDisplayName);
-
-                        // ready to be executed
-                        Runnable r = makeBuildable(new BuildableItem(p));
-                        if (r != null) {
-                            p.leave(this);
-                            r.run();
-                            // JENKINS-28926 we have removed a task from the blocked projects and added to building
-                            // thus we should update the snapshot so that subsequent blocked projects can correctly
-                            // determine if they are blocked by the lucky winner
-                            updateSnapshot();
-                        }
-                    } else {
-                        p.setCauseOfBlockage(causeOfBlockage);
+                    try {
+                        s.sortBuildableItems(buildables);
+                    } catch (Throwable e) {
+                        // We don't really care if the sort doesn't sort anything, we still should
+                        // continue to do our job. We'll complain about it and continue.
+                        LOGGER.log(Level.WARNING, "s.sortBuildableItems() threw Throwable: {0}", e);
                     }
                 }
+
+                // ensure that identification of blocked tasks is using the live state: JENKINS-27708 & JENKINS-27871
+                updateSnapshot();
+
+                assignBuildablesToExecutors(parked);
+            } finally {
+                updateSnapshot();
             }
-
-            // waitingList -> buildable/blocked
-            while (!waitingList.isEmpty()) {
-                WaitingItem top = peek();
-
-                if (top.timestamp.compareTo(new GregorianCalendar()) > 0) {
-                    LOGGER.log(Level.FINEST, "Finished moving all ready items from queue.");
-                    break; // finished moving all ready items from queue
-                }
-
-                top.leave(this);
-                CauseOfBlockage causeOfBlockage = getCauseOfBlockageForItem(top);
-                if (causeOfBlockage == null) {
-                    // ready to be executed immediately
-                    Runnable r = makeBuildable(new BuildableItem(top));
-                    String topTaskDisplayName = LOGGER.isLoggable(Level.FINEST) ? top.task.getFullDisplayName() : null;
-                    if (r != null) {
-                        LOGGER.log(Level.FINEST, "Executing runnable {0}", topTaskDisplayName);
-                        r.run();
-                    } else {
-                        LOGGER.log(Level.FINEST, "Item {0} was unable to be made a buildable and is now a blocked item.", topTaskDisplayName);
-                        new BlockedItem(top, CauseOfBlockage.fromMessage(Messages._Queue_HudsonIsAboutToShutDown())).enter(this);
-                    }
-                } else {
-                    // this can't be built now because another build is in progress
-                    // set this project aside.
-                    new BlockedItem(top, causeOfBlockage).enter(this);
-                }
-            }
-
-            if (s != null) {
-                try {
-                    s.sortBuildableItems(buildables);
-                } catch (Throwable e) {
-                    // We don't really care if the sort doesn't sort anything, we still should
-                    // continue to do our job. We'll complain about it and continue.
-                    LOGGER.log(Level.WARNING, "s.sortBuildableItems() threw Throwable: {0}", e);
-                }
-            }
-            
-            // Ensure that identification of blocked tasks is using the live state: JENKINS-27708 & JENKINS-27871
-            updateSnapshot();
-            
-            // allocate buildable jobs to executors
-            for (BuildableItem p : new ArrayList<>(
-                    buildables)) {// copy as we'll mutate the list in the loop
-                // one last check to make sure this build is not blocked.
-                CauseOfBlockage causeOfBlockage = getCauseOfBlockageForItem(p);
-                if (causeOfBlockage != null) {
-                    p.leave(this);
-                    new BlockedItem(p, causeOfBlockage).enter(this);
-                    LOGGER.log(Level.FINE, "Catching that {0} is blocked in the last minute", p);
-                    // JENKINS-28926 we have moved an unblocked task into the blocked state, update snapshot
-                    // so that other buildables which might have been blocked by this can see the state change
-                    updateSnapshot();
-                    continue;
-                }
-
-                String taskDisplayName = LOGGER.isLoggable(Level.FINEST) ? p.task.getFullDisplayName() : null;
-
-                if (p.task instanceof FlyweightTask) {
-                    Runnable r = makeFlyWeightTaskBuildable(new BuildableItem(p));
-                    if (r != null) {
-                        p.leave(this);
-                        LOGGER.log(Level.FINEST, "Executing flyweight task {0}", taskDisplayName);
-                        r.run();
-                        updateSnapshot();
-                    }
-                } else {
-
-                    List<JobOffer> candidates = new ArrayList<>(parked.size());
-                    List<CauseOfBlockage> reasons = new ArrayList<>(parked.size());
-                    for (JobOffer j : parked.values()) {
-                        CauseOfBlockage reason = j.getCauseOfBlockage(p);
-                        if (reason == null) {
-                            LOGGER.log(Level.FINEST,
-                                    "{0} is a potential candidate for task {1}",
-                                    new Object[]{j, taskDisplayName});
-                            candidates.add(j);
-                        } else {
-                            LOGGER.log(Level.FINEST, "{0} rejected {1}: {2}", new Object[] {j, taskDisplayName, reason});
-                            reasons.add(reason);
-                        }
-                    }
-
-                    MappingWorksheet ws = new MappingWorksheet(p, candidates);
-                    Mapping m = loadBalancer.map(p.task, ws);
-                    if (m == null) {
-                        // if we couldn't find the executor that fits,
-                        // just leave it in the buildables list and
-                        // check if we can execute other projects
-                        LOGGER.log(Level.FINER, "Failed to map {0} to executors. candidates={1} parked={2}",
-                                new Object[]{p, candidates, parked.values()});
-                        p.transientCausesOfBlockage = reasons.isEmpty() ? null : reasons;
-                        continue;
-                    }
-
-                    // found a matching executor. use it.
-                    WorkUnitContext wuc = new WorkUnitContext(p);
-                    LOGGER.log(Level.FINEST, "Found a matching executor for {0}. Using it.", taskDisplayName);
-                    m.execute(wuc);
-
-                    p.leave(this);
-                    if (!wuc.getWorkUnits().isEmpty()) {
-                        LOGGER.log(Level.FINEST, "BuildableItem {0} marked as pending.", taskDisplayName);
-                        makePending(p);
-                    }
-                    else
-                        LOGGER.log(Level.FINEST, "BuildableItem {0} with empty work units!?", p);
-
-                    // Ensure that identification of blocked tasks is using the live state: JENKINS-27708 & JENKINS-27871
-                    // The creation of a snapshot itself should be relatively cheap given the expected rate of
-                    // job execution. You probably would need 100's of jobs starting execution every iteration
-                    // of maintain() before this could even start to become an issue and likely the calculation
-                    // of getCauseOfBlockageForItem(p) will become a bottleneck before updateSnapshot() will. Additionally
-                    // since the snapshot itself only ever has at most one reference originating outside of the stack
-                    // it should remain in the eden space and thus be cheap to GC.
-                    // See https://jenkins-ci.org/issue/27708?focusedCommentId=225819&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-225819
-                    // or https://jenkins-ci.org/issue/27708?focusedCommentId=225906&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-225906
-                    // for alternative fixes of this issue.
-                    updateSnapshot();
-                }
-            }
-        } finally { updateSnapshot(); } } finally {
+        } finally {
             lock.unlock();
         }
     }
