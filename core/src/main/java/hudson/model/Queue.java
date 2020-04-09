@@ -1460,6 +1460,58 @@ public class Queue extends ResourceController implements Saveable {
         }
     }
 
+    // update parked
+    private Map<Executor, JobOffer> getParked(Computer[] computers) {
+        // The executors that are currently waiting for a job to run.
+        Map<Executor, JobOffer> parked = new HashMap<>();
+        for (Computer c : computers) {
+            for (Executor e : c.getAllExecutors()) {
+                if (!e.isInterrupted() && e.isParking()) {
+                    LOGGER.log(Level.FINEST, "{0} is parking and is waiting for a job to execute.", e.getDisplayName());
+                    parked.put(e, new JobOffer(e));
+                }
+            }
+        }
+        return parked;
+    }
+
+    // get pending executors with no work unit to execute
+    private List<BuildableItem> getLostPendings(Computer[] computers) {
+        List<BuildableItem> lostPendings = new ArrayList<>(pendings);
+        for (Computer c : computers) {
+            for (Executor e : c.getAllExecutors()) {
+                if (e.isInterrupted()) {
+                    // JENKINS-28840 we will deadlock if we try to touch this executor while interrupt flag set
+                    // we need to clear lost pendings as we cannot know what work unit was on this executor
+                    // while it is interrupted. (All this dancing is a result of Executor extending Thread)
+                    lostPendings.clear(); // we'll get them next time around when the flag is cleared.
+                    LOGGER.log(Level.FINEST,
+                            "Interrupt thread for executor {0} is set and we do not know what work unit was on the executor.",
+                            e.getDisplayName());
+                    return lostPendings;
+                }
+                if (e.getCurrentWorkUnit() != null) {
+                    lostPendings.remove(e.getCurrentWorkUnit().context.item);
+                }
+            }
+        }
+        return lostPendings;
+    }
+
+    // remove lost pendings from the pendings list
+    private void updatePendings(List<BuildableItem> lostPendings) {
+        for (BuildableItem p: lostPendings) {
+            if (LOGGER.isLoggable(Level.FINE)) {
+                LOGGER.log(Level.FINE,
+                        "BuildableItem {0}: pending -> buildable as the assigned executor disappeared",
+                        p.task.getFullDisplayName());
+            }
+            p.isPending = false;
+            pendings.remove(p);
+            makeBuildable(p); // TODO whatever this is for, the return value is being ignored, so this does nothing at all
+        }
+    }
+
     /**
      * Queue maintenance.
      *
@@ -1483,43 +1535,11 @@ public class Queue extends ResourceController implements Saveable {
             LOGGER.log(Level.FINE, "Queue maintenance started on {0} with {1}", new Object[] {this, snapshot});
 
             // The executors that are currently waiting for a job to run.
-            Map<Executor, JobOffer> parked = new HashMap<>();
+            Map<Executor, JobOffer> parked = getParked(jenkins.getComputers());
 
-            {// update parked (and identify any pending items whose executor has disappeared)
-                List<BuildableItem> lostPendings = new ArrayList<>(pendings);
-                for (Computer c : jenkins.getComputers()) {
-                    for (Executor e : c.getAllExecutors()) {
-                        if (e.isInterrupted()) {
-                            // JENKINS-28840 we will deadlock if we try to touch this executor while interrupt flag set
-                            // we need to clear lost pendings as we cannot know what work unit was on this executor
-                            // while it is interrupted. (All this dancing is a result of Executor extending Thread)
-                            lostPendings.clear(); // we'll get them next time around when the flag is cleared.
-                            LOGGER.log(Level.FINEST,
-                                    "Interrupt thread for executor {0} is set and we do not know what work unit was on the executor.",
-                                    e.getDisplayName());
-                            continue;
-                        }
-                        if (e.isParking()) {
-                            LOGGER.log(Level.FINEST, "{0} is parking and is waiting for a job to execute.", e.getDisplayName());
-                            parked.put(e, new JobOffer(e));
-                        }
-                        final WorkUnit workUnit = e.getCurrentWorkUnit();
-                        if (workUnit != null) {
-                            lostPendings.remove(workUnit.context.item);
-                        }
-                    }
-                }
-                // pending -> buildable
-                for (BuildableItem p: lostPendings) {
-                    if (LOGGER.isLoggable(Level.FINE)) {
-                        LOGGER.log(Level.FINE,
-                            "BuildableItem {0}: pending -> buildable as the assigned executor disappeared",
-                            p.task.getFullDisplayName());
-                    }
-                    p.isPending = false;
-                    pendings.remove(p);
-                    makeBuildable(p); // TODO whatever this is for, the return value is being ignored, so this does nothing at all
-                }
+            {
+                List<BuildableItem> lostPendings = getLostPendings(jenkins.getComputers());
+                updatePendings(lostPendings);
             }
 
             final QueueSorter s = sorter;
